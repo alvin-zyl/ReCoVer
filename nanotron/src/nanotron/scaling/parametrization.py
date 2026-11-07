@@ -1,0 +1,244 @@
+import math
+from abc import abstractmethod
+from enum import Enum, auto
+from typing import Dict, Optional
+
+from nanotron.config import ModelArgs, OptimizerArgs
+from nanotron.nn.layer_norm import TritonRMSNorm, DelayedTritonRMSNorm
+from nanotron.parallel.tensor_parallel.nn import (
+    TensorParallelColumnLinear,
+    TensorParallelEmbedding,
+    TensorParallelRowLinear,
+    TiedLinear,
+    BatchedTensorParallelColumnLinear,
+)
+from torch import nn
+from torch.nn import init
+from torch.nn import Linear
+
+
+class ParametrizationMethod(Enum):
+    STANDARD = auto()
+    SPECTRAL_MUP = auto()
+
+
+class Parametrizator:
+    def __init__(self, config: ModelArgs):
+        self.config = config
+
+    def parametrize(self, param_name: str, module: nn.Module, module_name: Optional[str] = None):
+        # print(f"module: {module}")
+        if not isinstance(module, tuple(self.MODULE_TO_PARAMETRIZE.keys())):
+            raise Exception(f"Parameter {param_name} was not initialized")
+
+        return self.MODULE_TO_PARAMETRIZE[type(module)](param_name, module, module_name)
+
+
+class StandardParametrizator(Parametrizator):
+    def __init__(self, config: ModelArgs):
+        super().__init__(config)
+        self.MODULE_TO_PARAMETRIZE = {
+            TensorParallelColumnLinear: self._parametrize_column_linear,
+            TensorParallelRowLinear: self._parametrize_row_linear,
+            TritonRMSNorm: self._parametrize_layer_norm,
+            TensorParallelEmbedding: self._parametrize_embedding,
+            Linear: self._parametrize_nn_linear,
+            TiedLinear: self._parametrize_tied_linear,
+            DelayedTritonRMSNorm: self._parametrize_layer_norm,
+            BatchedTensorParallelColumnLinear: self._parametrize_column_linear,
+        }
+
+        self.std = config.init_method.std
+        self.num_layers = config.model_config.num_hidden_layers
+
+    def _parametrize_column_linear(self, param_name: str, module: nn.Module, module_name: Optional[str] = None):
+        assert param_name in ["weight", "bias"]
+
+        if "weight" == param_name:
+            init.normal_(module.weight, mean=0.0, std=self.std)
+        elif "bias" == param_name:
+            module.bias.zero_()
+
+    def _parametrize_row_linear(self, param_name: str, module: nn.Module, module_name: Optional[str] = None):
+        assert param_name in ["weight", "bias"]
+
+        if "weight" == param_name:
+            std = self.std / math.sqrt(2 * self.num_layers)
+            init.normal_(module.weight, mean=0.0, std=std)
+        elif "bias" == param_name:
+            module.bias.zero_()
+
+    def _parametrize_layer_norm(self, param_name: str, module: nn.Module, module_name: Optional[str] = None):
+        assert param_name in ["weight", "bias"]
+
+        if "weight" == param_name:
+            # TODO @thomasw21: Sometimes we actually want 0
+            module.weight.fill_(1)
+        elif "bias" == param_name:
+            module.bias.zero_()
+
+    def _parametrize_embedding(self, param_name: str, module: nn.Module, module_name: Optional[str] = None):
+        assert param_name in ["weight"]
+
+        if "weight" == param_name:
+            init.normal_(module.weight, mean=0.0, std=self.std)
+
+    def _parametrize_nn_linear(self, param_name: str, module: nn.Module, module_name: Optional[str] = None):
+        assert param_name in ["weight", "bias"]
+
+        if "weight" == param_name:
+            init.normal_(module.weight, mean=0.0, std=self.std)
+        elif "bias" == param_name:
+            module.bias.zero_()
+
+    def _parametrize_tied_linear(self, param_name: str, module: nn.Module, module_name: Optional[str] = None):
+        assert param_name in ["weight", "bias"]
+
+        if "weight" == param_name:
+            init.normal_(module.weight, mean=0.0, std=self.std)
+        elif "bias" == param_name:
+            module.bias.zero_()
+
+
+class SpectralMupParametrizator(Parametrizator):
+    """
+    A Spectral Condition for Feature Learning by Greg Yang, et al.
+    https://arxiv.org/abs/2310.17813
+    """
+
+    def __init__(self, config: ModelArgs):
+        super().__init__(config)
+        self.MODULE_TO_PARAMETRIZE = {
+            TensorParallelColumnLinear: self._parametrize_mup_weight,
+            TensorParallelRowLinear: self._parametrize_mup_weight,
+            TritonRMSNorm: self._parametrize_layer_norm,
+            TensorParallelEmbedding: self._parametrize_embedding,
+        }
+        self.std = 1.0
+
+    @staticmethod
+    def _compute_spectral_std(std: float, fan_in: int, fan_out: int):
+        """
+        Parametrization 1 (Spectral parametrization)
+        Page 8, A Spectral Condition for Feature Learning by Greg Yang, et al.
+
+        σₗ = Θ(1/√nₗ₋₁ min{1, √(nₗ/nₗ₋₁)})
+        """
+        return (std / math.sqrt(fan_in)) * min(1, math.sqrt(fan_out / fan_in))
+
+    def _parametrize_mup_weight(self, param_name: str, module: nn.Module, module_name: Optional[str] = None):
+        assert param_name in ["weight", "bias"]
+
+        data = module.weight if param_name == "weight" else module.bias
+        fan_in, fan_out = init._calculate_fan_in_and_fan_out(data)
+        world_size = module.world_size
+
+        if isinstance(module, TensorParallelColumnLinear):
+            fan_out = fan_out * world_size
+        elif isinstance(module, TensorParallelRowLinear):
+            fan_in = fan_in * world_size
+        else:
+            raise ValueError(f"Unknown module {module}")
+
+        std = SpectralMupParametrizator._compute_spectral_std(std=self.std, fan_in=fan_in, fan_out=fan_out)
+        init.normal_(data, mean=0.0, std=std)
+
+    def _parametrize_layer_norm(self, param_name: str, module: nn.Module, module_name: Optional[str] = None):
+        assert param_name in ["weight", "bias"]
+
+        # NOTE: you're free to change the initialization of layer norm
+        # as it's not a part of µTransfer
+        if "weight" == param_name:
+            module.weight.fill_(1)
+        elif "bias" == param_name:
+            module.bias.zero_()
+
+    def _parametrize_embedding(self, param_name: str, module: nn.Module, module_name: Optional[str] = None):
+        assert param_name in ["weight"]
+
+        # NOTE: you're free to change the initialization of input embedding/lm head
+        if "weight" == param_name:
+            init.normal_(module.weight, mean=0.0, std=self.std)
+
+
+class SpectralMupForMuonParametrizator(SpectralMupParametrizator):
+    def __init__(self, config: ModelArgs):
+        super().__init__(config)
+
+    def _parametrize_mup_weight(self, param_name: str, module: nn.Module, module_name: Optional[str] = None):
+        assert param_name in ["weight", "bias"]
+
+        data = module.weight if param_name == "weight" else module.bias
+
+        if "lm_head" in module_name or "o_proj" in module_name or "down_proj" in module_name:
+            init.zeros_(data)
+        else:
+            std = self.std * math.sqrt(1.0 / self.config.model_config.hidden_size)
+            init.normal_(data, mean=0.0, std=std)
+
+    def _parametrize_embedding(self, param_name: str, module: nn.Module, module_name: Optional[str] = None):
+        assert param_name in ["weight"]
+
+        # NOTE: you're free to change the initialization of input embedding/lm head
+        if "weight" == param_name:
+            init.normal_(module.weight, mean=0.0, std=self.std * 0.1)
+
+
+class LearningRateForParametrizator:
+    def __init__(self, optimizer_args: OptimizerArgs, names_to_modules: Dict[str, nn.Module]):
+        self.lr = optimizer_args.learning_rate_scheduler.learning_rate
+        self.names_to_modules = names_to_modules
+
+    @abstractmethod
+    def get_lr(self, param_name: str, module: nn.Module) -> float:
+        raise NotImplementedError
+
+
+class LearningRateForSP(LearningRateForParametrizator):
+    """All parameters get the same learning rate."""
+
+    def get_lr(self, param_name: str, param: nn.Module) -> float:
+        return self.lr
+
+
+class LearningRateForSpectralMup(LearningRateForParametrizator):
+    """
+    A Spectral Condition for Feature Learning by Greg Yang, et al.
+
+    NOTE: each parameter gets a custom learning rate based on its fan-in and fan-out.
+    """
+
+    def __init__(self, optimizer_args: OptimizerArgs, names_to_modules: Dict[str, nn.Module]):
+        super().__init__(optimizer_args, names_to_modules)
+        self.mup_r = optimizer_args.learning_rate_scheduler.mup_r
+
+    def _get_mup_lr(self):
+        return self.lr / self.mup_r
+
+    def _get_global_lr(self) -> float:
+        return self.lr
+
+    def get_lr(self, param_name: str, param: nn.Parameter) -> float:
+        """Return the learning rate for the given parameter."""
+        # NOTE: param_name should be like 'model.token_position_embeddings.pp_block.token_embedding.weight'
+        # since names_to_modules map module_name to module
+        # so we remove the .weight and .bias from param_name to get the module_name
+        module_name = param_name.rsplit(".", 1)[0]
+        module = self.names_to_modules[module_name]
+        match module:
+            case TensorParallelEmbedding():
+                return self._get_global_lr()
+            case TritonRMSNorm():
+                return self._get_mup_lr()
+            case TensorParallelColumnLinear():
+                if "lm_head" not in param_name:
+                    return self._get_global_lr()
+                else:
+                    return self._get_mup_lr()
+                return (
+                    self._get_global_lr() 
+                    if "lm_head" not in param_name 
+                    else self._get_mup_lr()
+                )
+            case TensorParallelRowLinear():
+                return self._get_global_lr()

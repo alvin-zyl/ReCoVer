@@ -1,0 +1,2 @@
+# GitHub language statistics: count ReCoVer code, not the bundled PyTorch tree.
+pytorch/** linguist-vendored

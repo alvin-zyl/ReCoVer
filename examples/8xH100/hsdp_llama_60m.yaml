@@ -1,0 +1,14 @@
+# HSDP training of Llama 60M on 4 GPUs: 2 replicas, each sharded over 2 GPUs.
+# Options of train/main_hsdp.py as option: value (list them with `recover hsdp --script-help`).
+# Used by hsdp_llama_60m.sh and hsdp_llama_60m_nccl.sh. The dataset path defaults to $RECOVER_DATASET_PATH.
+model_config: configs/llama_60m.json
+hsdp_shard_size: 2
+batch_size: 64
+total_batch_size: 256
+num_training_steps: 1000
+warmup_steps: 100
+weight_decay: 0.1
+grad_clipping: 0.0
+dtype: bfloat16
+offline_mode: true
+mixed_precision: true

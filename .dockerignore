@@ -1,0 +1,7 @@
+# Outputs of local in-tree builds; the image builds everything itself.
+**/__pycache__
+**/*.egg-info
+build
+dist
+pytorch/build
+nanotron/build
